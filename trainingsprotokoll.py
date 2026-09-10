@@ -10,19 +10,22 @@ import streamlit as st
 
 DATA_FILE = Path(__file__).with_name("trainingseinheiten.json")
 USERS_FILE = Path(__file__).with_name("accounts.json")
-ROLES = ["Athlet", "Trainer"]
+DEFAULT_TRAINER_ID = "default-trainer-account"
+ROLES = ["Athlet"]
 DISCIPLINES = [
-	"Sprint",
-	"Mittelstrecke",
-	"Langstrecke",
-	"Sprung",
-	"Wurf",
-	"Krafttraining",
-	"Regeneration",
-	"Wettkampf",
-	"Sonstiges",
+	"Dauerlauf",
+	"Tempodauerlauf",
+	"Schwelle",
+	"VO2max",
+	"Berganläufe",
+	"WKA 1500",
+	"WKA 800",
+	"SKA",
+	"Sprints",
+	"Kraft",
+	"SK nerval",
 ]
-INTENSITIES = ["Locker", "Moderat", "Hart", "Maximal"]
+INTENSITIES = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"]
 
 MONTHS = [
 	"Januar", "Februar", "März", "April", "Mai", "Juni",
@@ -62,6 +65,19 @@ def save_users(users):
 		json.dump(users, file, ensure_ascii=False, indent=2)
 
 
+def ensure_default_trainer(users):
+	athletes = [user for user in users if user.get("role") != "Trainer"]
+	default_trainer = {
+		"id": DEFAULT_TRAINER_ID,
+		"name": "Trainer",
+		"role": "Trainer",
+	}
+	updated_users = athletes + [default_trainer]
+	if updated_users != users:
+		save_users(updated_users)
+	return updated_users
+
+
 def user_label(user):
 	return f"{user['name']} ({user['role']})"
 
@@ -96,16 +112,32 @@ def render_calendar(sessions, year, month):
 					continue
 				selected_day = date(year, month, day_number)
 				day_sessions = sessions_for_day(sessions, selected_day)
-				label = f"**{day_number}**"
+				day_label = str(day_number)
 				if selected_day == date.today():
-					label += " · heute"
-				st.markdown(label)
+					day_label += " · heute"
+				if st.button(
+					day_label,
+					key=f"calendar_day_{selected_day.isoformat()}",
+					width="stretch",
+				):
+					st.session_state.calendar_selected_date = selected_day.isoformat()
+					st.session_state.calendar_dialog_open = True
 				if not day_sessions:
-					st.caption("-")
+					st.caption("Keine Einheit")
+					continue
+				if selected_day != date.today():
+					st.caption(f"{len(day_sessions)} Einheit(en) · Tag öffnen für Details")
 					continue
 				for session in day_sessions:
+					assignment_label = "Vorgabe · " if session.get("is_assignment") else ""
+					if session.get("is_assignment_result"):
+						assignment_label = "Ergebnis · "
+					if session.get("is_assignment") and session.get("results", {}).get(
+						st.session_state.get("current_user_id", "")
+					):
+						assignment_label = "Vorgabe · Ergebnisse eingetragen · "
 					st.markdown(
-						f"`{session['discipline']}`  \n"
+						f"`{assignment_label}{session['discipline']}`  \n"
 						f"{session['title']}  \n"
 						f"{format_duration(session['duration'])} · {session['intensity']}"
 					)
@@ -127,6 +159,138 @@ def add_session(sessions, values, user):
 			"created_at": datetime.now().isoformat(timespec="seconds"),
 		}
 	)
+	save_sessions(sessions)
+
+
+def add_assignment(sessions, values, trainer, athlete_ids):
+	sessions.append(
+		{
+			"id": str(uuid4()),
+			"user_id": trainer["id"],
+			"athlete_name": trainer["name"],
+			"date": values["date"].isoformat(),
+			"title": values["title"].strip(),
+			"discipline": values["discipline"],
+			"duration": values["duration"],
+			"distance": values["distance"],
+			"intensity": values["intensity"],
+			"notes": values["notes"].strip(),
+			"is_assignment": True,
+			"assigned_athlete_ids": athlete_ids,
+			"results": {},
+			"created_at": datetime.now().isoformat(timespec="seconds"),
+		}
+	)
+	save_sessions(sessions)
+
+
+def update_assignment(sessions, assignment_id, values, athlete_ids):
+	for session in sessions:
+		if session["id"] == assignment_id and session.get("is_assignment"):
+			session.update(
+				{
+					"date": values["date"].isoformat(),
+					"title": values["title"].strip(),
+					"discipline": values["discipline"],
+					"duration": values["duration"],
+					"distance": values["distance"],
+					"intensity": values["intensity"],
+					"notes": values["notes"].strip(),
+					"assigned_athlete_ids": athlete_ids,
+				}
+			)
+			break
+	save_sessions(sessions)
+
+
+def delete_assignment(sessions, assignment_id, trainer_id):
+	assignment = next(
+		(
+			session for session in sessions
+			if session["id"] == assignment_id
+			and session.get("is_assignment")
+			and session.get("user_id") == trainer_id
+		),
+		None,
+	)
+	if assignment is None:
+		return False
+	sessions[:] = [
+		session for session in sessions
+		if session["id"] != assignment_id and session.get("assignment_id") != assignment_id
+	]
+	save_sessions(sessions)
+	return True
+
+
+def save_assignment_result(sessions, session_id, athlete, values):
+	assignment = next(session for session in sessions if session["id"] == session_id)
+	result = {
+		"athlete_name": athlete["name"],
+		"duration": values["duration"],
+		"distance": values["distance"],
+		"intensity": values["intensity"],
+		"notes": values["notes"].strip(),
+		"completed_at": datetime.now().isoformat(timespec="seconds"),
+	}
+	assignment.setdefault("results", {})[athlete["id"]] = result
+
+	result_session = next(
+		(
+			session for session in sessions
+			if session.get("is_assignment_result")
+			and session.get("assignment_id") == session_id
+			and session.get("user_id") == athlete["id"]
+		),
+		None,
+	)
+	result_values = {
+		"date": assignment["date"],
+		"title": f"Ergebnis: {assignment['title']}",
+		"discipline": assignment["discipline"],
+		"duration": result["duration"],
+		"distance": result["distance"],
+		"intensity": result["intensity"],
+		"notes": result["notes"],
+	}
+	if result_session is None:
+		sessions.append(
+			{
+				"id": str(uuid4()),
+				"user_id": athlete["id"],
+				"athlete_name": athlete["name"],
+				"assignment_id": session_id,
+				"is_assignment_result": True,
+				"created_at": result["completed_at"],
+				"date": assignment["date"],
+				"title": result_values["title"],
+				"discipline": result_values["discipline"],
+				"duration": result_values["duration"],
+				"distance": result_values["distance"],
+				"intensity": result_values["intensity"],
+				"notes": result_values["notes"],
+			}
+		)
+	else:
+		result_session.update(result_values)
+	save_sessions(sessions)
+
+
+def update_session(sessions, session_id, values):
+	for session in sessions:
+		if session["id"] == session_id:
+			session.update(
+				{
+					"date": values["date"].isoformat(),
+					"title": values["title"].strip(),
+					"discipline": values["discipline"],
+					"duration": values["duration"],
+					"distance": values["distance"],
+					"intensity": values["intensity"],
+					"notes": values["notes"].strip(),
+				}
+			)
+			break
 	save_sessions(sessions)
 
 
@@ -181,7 +345,7 @@ def render_authentication(users):
 	with register_tab:
 		with st.form("register_form", clear_on_submit=True):
 			name = st.text_input("Name", placeholder="z. B. Anna Müller")
-			role = st.selectbox("Rolle", ROLES)
+			st.caption("Neue Accounts werden als Athleten angelegt. Der Trainer-Account ist bereits vorgegeben.")
 			register_submitted = st.form_submit_button("Account erstellen", type="primary")
 		if register_submitted:
 			clean_name = name.strip()
@@ -190,7 +354,7 @@ def render_authentication(users):
 			elif any(user["name"].casefold() == clean_name.casefold() for user in users):
 				st.error("Dieser Name ist bereits registriert.")
 			else:
-				new_user = create_user(clean_name, role)
+				new_user = create_user(clean_name, "Athlet")
 				save_users(users + [new_user])
 				st.success("Account erstellt. Du wirst angemeldet.")
 				return new_user
@@ -210,10 +374,12 @@ st.markdown(
 	unsafe_allow_html=True,
 )
 
-users = load_users()
+users = ensure_default_trainer(load_users())
 sessions = load_sessions()
 
 st.session_state.setdefault("current_user_id", None)
+st.session_state.setdefault("calendar_selected_date", None)
+st.session_state.setdefault("calendar_dialog_open", False)
 current_user = next(
 	(user for user in users if user["id"] == st.session_state.current_user_id),
 	None,
@@ -229,8 +395,13 @@ today = date.today()
 visible_sessions = (
 	sessions
 	if current_user["role"] == "Trainer"
-	else [session for session in sessions if session.get("user_id") == current_user["id"]]
+	else [
+		session for session in sessions
+		if session.get("user_id") == current_user["id"]
+		or current_user["id"] in session.get("assigned_athlete_ids", [])
+	]
 )
+today_sessions = sessions_for_day(visible_sessions, date.today())
 
 st.title("TrackLog")
 st.caption("Dein Trainingstagebuch für Leichtathletik")
@@ -243,7 +414,7 @@ def new_session_dialog():
 		session_date = st.date_input("Datum", today, format="DD.MM.YYYY")
 		title = st.text_input("Bezeichnung", placeholder="z. B. 6 × 200 m")
 		discipline = st.selectbox("Disziplin", DISCIPLINES)
-		intensity = st.select_slider("Intensität", options=INTENSITIES, value="Moderat")
+		intensity = st.select_slider("Intensität", options=INTENSITIES, value=INTENSITIES[0])
 		duration = st.number_input("Dauer in Minuten", min_value=1, max_value=600, value=60, step=5)
 		distance = st.number_input("Distanz in km", min_value=0.0, max_value=200.0, value=0.0, step=0.1)
 		notes = st.text_area("Notizen", placeholder="Gefühl, Zeiten, Wiederholungen ...")
@@ -270,8 +441,339 @@ def new_session_dialog():
 			st.rerun()
 
 
-if st.button("+ Neue Trainingseinheit", type="primary"):
+def render_assignment_form(default_date=None, form_key="assignment_form"):
+	athletes = [user for user in users if user["role"] == "Athlet"]
+	if not athletes:
+		st.info("Es gibt noch keine Athleten-Accounts.")
+		return
+
+	with st.form(form_key, clear_on_submit=True):
+		if default_date is None:
+			assignment_date = st.date_input("Datum", today, format="DD.MM.YYYY")
+		else:
+			assignment_date = default_date
+			st.write(f"Datum: {default_date.strftime('%d.%m.%Y')}")
+		title = st.text_input("Bezeichnung", placeholder="z. B. 5 × 1.000 m")
+		selected_athletes = st.multiselect(
+			"Athleten auswählen",
+			options=[athlete["id"] for athlete in athletes],
+			format_func=lambda athlete_id: next(
+				athlete["name"] for athlete in athletes if athlete["id"] == athlete_id
+			),
+		)
+		discipline = st.selectbox("Disziplin", DISCIPLINES)
+		intensity = st.select_slider("Intensität", options=INTENSITIES, value=INTENSITIES[0])
+		duration = st.number_input("Vorgesehene Dauer in Minuten", min_value=1, max_value=600, value=60, step=5)
+		distance = st.number_input("Vorgesehene Distanz in km", min_value=0.0, max_value=200.0, value=0.0, step=0.1)
+		notes = st.text_area("Anweisungen", placeholder="Serien, Pausen, Tempo oder weitere Hinweise ...")
+		created = st.form_submit_button("Vorgabe veröffentlichen", type="primary", width="stretch")
+
+	if created:
+		if not title.strip():
+			st.error("Bitte gib der Vorgabe eine Bezeichnung.")
+		elif not selected_athletes:
+			st.error("Bitte wähle mindestens einen Athleten aus.")
+		else:
+			add_assignment(
+				sessions,
+				{
+					"date": assignment_date,
+					"title": title,
+					"discipline": discipline,
+					"intensity": intensity,
+					"duration": duration,
+					"distance": distance,
+					"notes": notes,
+				},
+				current_user,
+				selected_athletes,
+			)
+			st.success("Vorgabe veröffentlicht.")
+			st.rerun()
+
+
+@st.dialog("Trainingsvorgabe erstellen")
+def assignment_dialog():
+	render_assignment_form()
+
+
+def render_assignment_edit_form(assignment, selected_day):
+	athletes = [user for user in users if user["role"] == "Athlet"]
+	with st.form(f"edit_assignment_{assignment['id']}"):
+		title = st.text_input("Bezeichnung", value=assignment.get("title", ""))
+		selected_athletes = st.multiselect(
+			"Athleten auswählen",
+			options=[athlete["id"] for athlete in athletes],
+			default=[
+				athlete_id for athlete_id in assignment.get("assigned_athlete_ids", [])
+				if athlete_id in {athlete["id"] for athlete in athletes}
+			],
+			format_func=lambda athlete_id: next(
+				athlete["name"] for athlete in athletes if athlete["id"] == athlete_id
+			),
+		)
+		discipline = st.selectbox(
+			"Disziplin",
+			DISCIPLINES,
+			index=DISCIPLINES.index(assignment["discipline"])
+			if assignment.get("discipline") in DISCIPLINES else 0,
+		)
+		intensity = st.select_slider(
+			"Intensität",
+			options=INTENSITIES,
+			value=assignment.get("intensity") if assignment.get("intensity") in INTENSITIES else INTENSITIES[0],
+		)
+		duration = st.number_input(
+			"Vorgesehene Dauer in Minuten",
+			min_value=1,
+			max_value=600,
+			value=int(assignment.get("duration", 60)),
+			step=5,
+		)
+		distance = st.number_input(
+			"Vorgesehene Distanz in km",
+			min_value=0.0,
+			max_value=200.0,
+			value=float(assignment.get("distance", 0.0)),
+			step=0.1,
+		)
+		notes = st.text_area("Anweisungen", value=assignment.get("notes", ""))
+		updated = st.form_submit_button("Vorgabe speichern", type="primary", width="stretch")
+
+	if updated:
+		if not title.strip():
+			st.error("Bitte gib der Vorgabe eine Bezeichnung.")
+		elif not selected_athletes:
+			st.error("Bitte wähle mindestens einen Athleten aus.")
+		else:
+			update_assignment(
+				sessions,
+				assignment["id"],
+				{
+					"date": selected_day,
+					"title": title,
+					"discipline": discipline,
+					"intensity": intensity,
+					"duration": duration,
+					"distance": distance,
+					"notes": notes,
+				},
+				selected_athletes,
+			)
+			st.success("Vorgabe geändert.")
+			st.rerun()
+
+
+@st.dialog("Trainingseinheit für diesen Tag")
+def calendar_session_dialog(selected_day):
+	day_sessions = sessions_for_day(visible_sessions, selected_day)
+	st.write(f"{selected_day.strftime('%d.%m.%Y')}")
+	if current_user["role"] == "Trainer":
+		assignment_sessions = [session for session in day_sessions if session.get("is_assignment")]
+		if day_sessions:
+			st.subheader("Vorhandene Einheiten")
+			for session in day_sessions:
+				entry_type = "Vorgabe" if session.get("is_assignment") else "Trainingseinheit"
+				st.caption(
+					f"{entry_type}: {session['title']} · {session['discipline']} · "
+					f"{format_duration(session['duration'])}"
+				)
+		if assignment_sessions:
+			assignment_mode = st.radio(
+				"Vorgabe auswählen",
+				["Neue Vorgabe erstellen", "Bestehende Vorgabe bearbeiten"],
+				key=f"trainer_assignment_mode_{selected_day.isoformat()}",
+			)
+			if assignment_mode == "Bestehende Vorgabe bearbeiten":
+				selected_assignment_id = st.selectbox(
+					"Vorgabe",
+					options=[session["id"] for session in assignment_sessions],
+					format_func=lambda session_id: next(
+						session["title"] for session in assignment_sessions if session["id"] == session_id
+					),
+					key=f"trainer_assignment_{selected_day.isoformat()}",
+				)
+				selected_assignment = next(
+					session for session in assignment_sessions if session["id"] == selected_assignment_id
+				)
+				render_assignment_edit_form(selected_assignment, selected_day)
+				if st.button("Vorgabe löschen", key=f"delete_assignment_{selected_day.isoformat()}"):
+					if delete_assignment(sessions, selected_assignment_id, current_user["id"]):
+						st.session_state.calendar_dialog_open = False
+						st.rerun()
+			else:
+				render_assignment_form(selected_day, form_key=f"calendar_assignment_{selected_day.isoformat()}")
+		else:
+			render_assignment_form(selected_day, form_key=f"calendar_assignment_{selected_day.isoformat()}")
+		return
+	assignment_sessions = [session for session in day_sessions if session.get("is_assignment")]
+	editable_sessions = [
+		session for session in day_sessions
+		if not session.get("is_assignment") and not session.get("is_assignment_result")
+	]
+	if current_user["role"] == "Athlet" and assignment_sessions:
+		available_modes = ["Trainingsergebnisse eintragen", "Neue Einheit hinzufügen"]
+		if editable_sessions:
+			available_modes.append("Bestehende Einheit bearbeiten")
+		mode = st.radio(
+			"Was möchtest du tun?",
+			available_modes,
+			key=f"calendar_mode_{selected_day.isoformat()}",
+		)
+		if mode == "Trainingsergebnisse eintragen":
+			selected_id = st.selectbox(
+				"Vorgabe auswählen",
+				options=[session["id"] for session in assignment_sessions],
+				format_func=lambda session_id: next(
+					session["title"] for session in assignment_sessions if session["id"] == session_id
+				),
+				key=f"assignment_session_{selected_day.isoformat()}",
+			)
+			assignment = next(session for session in assignment_sessions if session["id"] == selected_id)
+			st.info(
+				f"Vorgabe: {assignment['title']} · {assignment['discipline']} · "
+				f"{format_duration(assignment['duration'])}"
+			)
+			if assignment.get("notes"):
+				st.write(f"Anweisungen: {assignment['notes']}")
+			result = assignment.get("results", {}).get(current_user["id"], {})
+			with st.form(f"assignment_result_{selected_id}"):
+				st.subheader("Deine Trainingsergebnisse")
+				result_duration = st.number_input(
+					"Tatsächliche Dauer in Minuten",
+					min_value=1,
+					max_value=600,
+					value=int(result.get("duration", assignment.get("duration", 60))),
+					step=5,
+				)
+				result_distance = st.number_input(
+					"Tatsächliche Distanz in km",
+					min_value=0.0,
+					max_value=200.0,
+					value=float(result.get("distance", assignment.get("distance", 0.0))),
+					step=0.1,
+				)
+				result_intensity = st.select_slider(
+					"Tatsächliche Intensität",
+					options=INTENSITIES,
+					value=result.get("intensity", assignment.get("intensity", INTENSITIES[0])),
+				)
+				result_notes = st.text_area("Ergebnisse und Notizen", value=result.get("notes", ""))
+				result_submitted = st.form_submit_button("Ergebnisse speichern", type="primary", width="stretch")
+			if result_submitted:
+				save_assignment_result(
+					sessions,
+					selected_id,
+					current_user,
+					{
+						"duration": result_duration,
+						"distance": result_distance,
+						"intensity": result_intensity,
+						"notes": result_notes,
+					},
+				)
+				st.success("Deine Ergebnisse wurden gespeichert.")
+				st.session_state.calendar_dialog_open = False
+				st.rerun()
+			return
+	else:
+		mode = None
+
+	if day_sessions:
+		available_modes = ["Neue Einheit hinzufügen", "Bestehende Einheit bearbeiten"]
+		if mode is None:
+			mode = st.radio(
+				"Was möchtest du tun?",
+				available_modes,
+				key=f"calendar_mode_{selected_day.isoformat()}",
+			)
+	else:
+		mode = "Neue Einheit hinzufügen"
+		st.info("An diesem Tag gibt es noch keine Einheit. Lege jetzt eine neue an.")
+
+	if mode == "Bestehende Einheit bearbeiten":
+		editable_sessions = editable_sessions or day_sessions
+		selected_id = st.selectbox(
+			"Einheit auswählen",
+			options=[session["id"] for session in editable_sessions],
+			format_func=lambda session_id: next(
+				session["title"] for session in editable_sessions if session["id"] == session_id
+			),
+			key=f"calendar_session_{selected_day.isoformat()}",
+		)
+		selected_session = next(session for session in editable_sessions if session["id"] == selected_id)
+		with st.form(f"edit_session_{selected_id}"):
+			title = st.text_input("Bezeichnung", value=selected_session.get("title", ""))
+			discipline = st.selectbox(
+				"Disziplin",
+				DISCIPLINES,
+				index=DISCIPLINES.index(selected_session["discipline"])
+				if selected_session.get("discipline") in DISCIPLINES else 0,
+			)
+			intensity = st.select_slider(
+				"Intensität",
+				options=INTENSITIES,
+				value=selected_session["intensity"] if selected_session.get("intensity") in INTENSITIES else INTENSITIES[0],
+			)
+			duration = st.number_input("Dauer in Minuten", min_value=1, max_value=600, value=int(selected_session.get("duration", 60)), step=5)
+			distance = st.number_input("Distanz in km", min_value=0.0, max_value=200.0, value=float(selected_session.get("distance", 0.0)), step=0.1)
+			notes = st.text_area("Notizen", value=selected_session.get("notes", ""))
+			updated = st.form_submit_button("Änderungen speichern", type="primary", width="stretch")
+		if updated:
+			if not title.strip():
+				st.error("Bitte gib der Einheit eine Bezeichnung.")
+			else:
+				update_session(
+					sessions,
+					selected_id,
+					{
+						"date": selected_day,
+						"title": title,
+						"discipline": discipline,
+						"intensity": intensity,
+						"duration": duration,
+						"distance": distance,
+						"notes": notes,
+					},
+				)
+				st.success("Einheit geändert.")
+				st.session_state.calendar_dialog_open = False
+				st.rerun()
+	else:
+		with st.form(f"new_session_for_{selected_day.isoformat()}", clear_on_submit=True):
+			title = st.text_input("Bezeichnung", placeholder="z. B. 6 × 200 m")
+			discipline = st.selectbox("Disziplin", DISCIPLINES)
+			intensity = st.select_slider("Intensität", options=INTENSITIES, value=INTENSITIES[0])
+			duration = st.number_input("Dauer in Minuten", min_value=1, max_value=600, value=60, step=5)
+			distance = st.number_input("Distanz in km", min_value=0.0, max_value=200.0, value=0.0, step=0.1)
+			notes = st.text_area("Notizen", placeholder="Gefühl, Zeiten, Wiederholungen ...")
+			created = st.form_submit_button("Einheit speichern", type="primary", width="stretch")
+		if created:
+			if not title.strip():
+				st.error("Bitte gib der Einheit eine Bezeichnung.")
+			else:
+				add_session(
+					sessions,
+					{
+						"date": selected_day,
+						"title": title,
+						"discipline": discipline,
+						"intensity": intensity,
+						"duration": duration,
+						"distance": distance,
+						"notes": notes,
+					},
+					current_user,
+				)
+				st.success("Training gespeichert.")
+				st.session_state.calendar_dialog_open = False
+				st.rerun()
+
+
+if current_user["role"] != "Trainer" and st.button("+ Neue Trainingseinheit", type="primary"):
 	new_session_dialog()
+if current_user["role"] == "Trainer" and st.button("+ Trainingsvorgabe erstellen"):
+	assignment_dialog()
 
 
 with st.sidebar:
@@ -297,13 +799,15 @@ calendar_col, list_col = st.columns([1.45, 1])
 with calendar_col:
 	selected_month = st.date_input("Kalendermonat auswählen", today.replace(day=1), format="DD.MM.YYYY")
 	render_calendar(visible_sessions, selected_month.year, selected_month.month)
+	if st.session_state.calendar_dialog_open and st.session_state.calendar_selected_date:
+		calendar_session_dialog(date.fromisoformat(st.session_state.calendar_selected_date))
 
 with list_col:
-	st.subheader("Letzte Einheiten")
-	if not visible_sessions:
-		st.info("Noch keine Einheiten gespeichert. Nutze das Formular links, um zu starten.")
+	st.subheader("Heute")
+	if not today_sessions:
+		st.info("Für heute sind keine Einheiten eingetragen.")
 	else:
-		recent = sorted(visible_sessions, key=lambda session: session["date"], reverse=True)[:10]
+		recent = sorted(today_sessions, key=lambda session: session["date"], reverse=True)
 		for session in recent:
 			with st.container(border=True):
 				st.markdown(f"**{session['title']}** · {session['discipline']}")
@@ -317,6 +821,13 @@ with list_col:
 					st.write(f"Distanz: {session['distance']:.1f} km")
 				if session["notes"]:
 					st.caption(session["notes"])
+				if session.get("is_assignment") and current_user["role"] == "Athlet":
+					result = session.get("results", {}).get(current_user["id"])
+					if result:
+						st.success(
+							f"Ergebnisse eingetragen: {format_duration(result['duration'])} · "
+							f"{result['distance']:.1f} km"
+						)
 				for trainer_note in session.get("trainer_notes", []):
 					st.info(
 						f"Trainernotiz von {trainer_note.get('trainer_name', 'Trainer')}: "
@@ -324,14 +835,18 @@ with list_col:
 					)
 
 st.divider()
-st.subheader("Alle Einheiten")
-if visible_sessions:
-	table = pd.DataFrame(visible_sessions).sort_values("date", ascending=False)
+st.subheader("Einheiten von heute")
+if today_sessions:
+	table = pd.DataFrame(today_sessions).sort_values("date", ascending=False)
 	table["Datum"] = pd.to_datetime(table["date"]).dt.strftime("%d.%m.%Y")
 	table["Dauer"] = table["duration"].map(format_duration)
 	table["Distanz"] = table["distance"].map(lambda value: f"{value:.1f} km" if value else "-")
 	table["Trainernotizen"] = table.get("trainer_notes", pd.Series(index=table.index)).map(format_trainer_notes)
-	columns = ["Datum", "title", "discipline", "Dauer", "Distanz", "intensity", "notes", "Trainernotizen"]
+	table["Art"] = table.apply(
+		lambda row: "Vorgabe" if row.get("is_assignment") else "Ergebnis" if row.get("is_assignment_result") else "Training",
+		axis=1,
+	)
+	columns = ["Datum", "Art", "title", "discipline", "Dauer", "Distanz", "intensity", "notes", "Trainernotizen"]
 	if current_user["role"] == "Trainer":
 		table["Athlet"] = table.get("athlete_name", pd.Series(index=table.index)).fillna("Unbekannt")
 		columns.insert(1, "Athlet")
@@ -372,11 +887,11 @@ if visible_sessions:
 
 	if current_user["role"] == "Athlet":
 		delete_id = st.selectbox(
-			"Eigene Einheit löschen",
-			options=[session["id"] for session in visible_sessions],
+			"Eigene Einheit von heute löschen",
+			options=[session["id"] for session in today_sessions],
 			format_func=lambda item_id: next(
 				f"{session['date']} · {session['title']}"
-				for session in visible_sessions
+				for session in today_sessions
 				if session["id"] == item_id
 			),
 		)
